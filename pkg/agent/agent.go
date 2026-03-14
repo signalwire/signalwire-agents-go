@@ -261,6 +261,24 @@ func NewAgentBase(opts ...AgentOption) *AgentBase {
 }
 
 // ---------------------------------------------------------------------------
+// Accessor methods
+// ---------------------------------------------------------------------------
+
+// GetRoute returns the agent's configured route path.
+func (a *AgentBase) GetRoute() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.route
+}
+
+// GetName returns the agent's name.
+func (a *AgentBase) GetName() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.name
+}
+
+// ---------------------------------------------------------------------------
 // Prompt methods
 // ---------------------------------------------------------------------------
 
