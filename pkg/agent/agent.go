@@ -202,6 +202,10 @@ type AgentBase struct {
 	// SIP routing
 	sipRoutingEnabled bool
 	sipUsernames      map[string]bool
+
+	// MCP integration
+	mcpServers        []map[string]any // external MCP server configs
+	mcpServerEnabled  bool             // expose /mcp endpoint
 }
 
 // NewAgentBase creates a new AgentBase with default values and applies the
@@ -235,6 +239,7 @@ func NewAgentBase(opts ...AgentOption) *AgentBase {
 		answerConfig:       make(map[string]any),
 		swaigQueryParams:   make(map[string]string),
 		sipUsernames:       make(map[string]bool),
+		mcpServers:         make([]map[string]any, 0),
 	}
 
 	for _, opt := range opts {
@@ -790,6 +795,212 @@ func (a *AgentBase) EnableDebugRoutes() *AgentBase {
 }
 
 // ---------------------------------------------------------------------------
+// MCP methods
+// ---------------------------------------------------------------------------
+
+// MCPServerConfig holds configuration for an external MCP server connection.
+type MCPServerConfig struct {
+	URL          string
+	Headers      map[string]string
+	Resources    bool
+	ResourceVars map[string]string
+}
+
+// AddMcpServer adds an external MCP server for tool discovery and invocation.
+// Tools are discovered via the MCP protocol at session start and registered as
+// SWAIG functions. Returns self for method chaining.
+func (a *AgentBase) AddMcpServer(cfg MCPServerConfig) *AgentBase {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	server := map[string]any{"url": cfg.URL}
+	if len(cfg.Headers) > 0 {
+		server["headers"] = cfg.Headers
+	}
+	if cfg.Resources {
+		server["resources"] = true
+	}
+	if len(cfg.ResourceVars) > 0 {
+		server["resource_vars"] = cfg.ResourceVars
+	}
+	a.mcpServers = append(a.mcpServers, server)
+	return a
+}
+
+// EnableMcpServer exposes this agent's tools as an MCP server endpoint at /mcp.
+// The endpoint speaks JSON-RPC 2.0 (MCP protocol) and supports initialize,
+// tools/list, tools/call, and ping. Returns self for method chaining.
+func (a *AgentBase) EnableMcpServer() *AgentBase {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.mcpServerEnabled = true
+	return a
+}
+
+// buildMcpToolList converts registered tools to MCP tool format.
+func (a *AgentBase) buildMcpToolList() []map[string]any {
+	tools := make([]map[string]any, 0)
+	for _, name := range a.toolOrder {
+		td, ok := a.tools[name]
+		if !ok {
+			continue
+		}
+		tool := map[string]any{
+			"name":        td.Name,
+			"description": td.Description,
+		}
+		if td.Parameters != nil {
+			tool["inputSchema"] = map[string]any{
+				"type":       "object",
+				"properties": td.Parameters,
+			}
+		} else {
+			tool["inputSchema"] = map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			}
+		}
+		tools = append(tools, tool)
+	}
+	return tools
+}
+
+// handleMcpRequest processes a single MCP JSON-RPC 2.0 request and returns
+// the response map.
+func (a *AgentBase) handleMcpRequest(body map[string]any) map[string]any {
+	jsonrpc, _ := body["jsonrpc"].(string)
+	method, _ := body["method"].(string)
+	reqID := body["id"]
+	params, _ := body["params"].(map[string]any)
+	if params == nil {
+		params = make(map[string]any)
+	}
+
+	if jsonrpc != "2.0" {
+		return mcpError(reqID, -32600, "Invalid JSON-RPC version")
+	}
+
+	// Initialize handshake
+	if method == "initialize" {
+		return map[string]any{
+			"jsonrpc": "2.0",
+			"id":      reqID,
+			"result": map[string]any{
+				"protocolVersion": "2025-06-18",
+				"capabilities":   map[string]any{"tools": map[string]any{}},
+				"serverInfo": map[string]any{
+					"name":    a.name,
+					"version": "1.0.0",
+				},
+			},
+		}
+	}
+
+	// Initialized notification
+	if method == "notifications/initialized" {
+		return map[string]any{"jsonrpc": "2.0", "id": reqID, "result": map[string]any{}}
+	}
+
+	// List tools
+	if method == "tools/list" {
+		a.mu.RLock()
+		tools := a.buildMcpToolList()
+		a.mu.RUnlock()
+		return map[string]any{
+			"jsonrpc": "2.0",
+			"id":      reqID,
+			"result":  map[string]any{"tools": tools},
+		}
+	}
+
+	// Call tool
+	if method == "tools/call" {
+		toolName, _ := params["name"].(string)
+		arguments, _ := params["arguments"].(map[string]any)
+		if arguments == nil {
+			arguments = make(map[string]any)
+		}
+
+		a.mu.RLock()
+		tool, ok := a.tools[toolName]
+		a.mu.RUnlock()
+
+		if !ok || tool == nil {
+			return mcpError(reqID, -32602, fmt.Sprintf("Unknown tool: %s", toolName))
+		}
+		if tool.Handler == nil {
+			return mcpError(reqID, -32602, fmt.Sprintf("Tool %s has no handler", toolName))
+		}
+
+		rawData := map[string]any{
+			"function": toolName,
+			"argument": map[string]any{"parsed": []any{arguments}},
+		}
+
+		result := tool.Handler(arguments, rawData)
+
+		responseText := ""
+		if result != nil {
+			m := result.ToMap()
+			if r, ok := m["response"].(string); ok {
+				responseText = r
+			}
+		}
+
+		return map[string]any{
+			"jsonrpc": "2.0",
+			"id":      reqID,
+			"result": map[string]any{
+				"content": []map[string]any{
+					{"type": "text", "text": responseText},
+				},
+				"isError": false,
+			},
+		}
+	}
+
+	// Ping
+	if method == "ping" {
+		return map[string]any{"jsonrpc": "2.0", "id": reqID, "result": map[string]any{}}
+	}
+
+	return mcpError(reqID, -32601, fmt.Sprintf("Method not found: %s", method))
+}
+
+// mcpError builds a JSON-RPC error response.
+func mcpError(reqID any, code int, message string) map[string]any {
+	return map[string]any{
+		"jsonrpc": "2.0",
+		"id":      reqID,
+		"error": map[string]any{
+			"code":    code,
+			"message": message,
+		},
+	}
+}
+
+// handleMcp is the HTTP handler for the /mcp endpoint.
+func (a *AgentBase) handleMcp(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxAgentRequestBody)
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(mcpError(nil, -32700, "Parse error"))
+		return
+	}
+
+	resp := a.handleMcpRequest(body)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// ---------------------------------------------------------------------------
 // SIP methods
 // ---------------------------------------------------------------------------
 
@@ -1175,6 +1386,11 @@ func (a *AgentBase) RenderSWML(requestData map[string]any, request *http.Request
 		aiConfig["debug_events"] = a.debugEventsLevel
 	}
 
+	// MCP servers
+	if len(a.mcpServers) > 0 {
+		aiConfig["mcp_servers"] = a.mcpServers
+	}
+
 	// 6. Add AI verb
 	doc.AddVerb("ai", aiConfig)
 
@@ -1268,6 +1484,15 @@ func (a *AgentBase) buildMux() *http.ServeMux {
 		ppRoute = "/post_prompt"
 	}
 	mux.HandleFunc(ppRoute, a.withAuth(a.handlePostPrompt))
+
+	// MCP server endpoint (no auth — MCP clients authenticate via headers)
+	if a.mcpServerEnabled {
+		mcpRoute := route + "/mcp"
+		if route == "/" {
+			mcpRoute = "/mcp"
+		}
+		mux.HandleFunc(mcpRoute, a.handleMcp)
+	}
 
 	return mux
 }
@@ -1443,6 +1668,10 @@ func (a *AgentBase) clone() *AgentBase {
 	for k, v := range a.sipUsernames {
 		c.sipUsernames[k] = v
 	}
+
+	c.mcpServers = make([]map[string]any, len(a.mcpServers))
+	copy(c.mcpServers, a.mcpServers)
+	c.mcpServerEnabled = a.mcpServerEnabled
 
 	return c
 }
